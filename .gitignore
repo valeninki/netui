@@ -1,0 +1,23 @@
+# Rust/Cargo
+/target/
+*.rs.bk
+*.pdb
+
+# Dependency locking is handled by flake.lock.
+/Cargo.lock
+
+# Nix
+/result
+/result-*
+/.direnv/
+
+# Editors
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+Thumbs.db
