@@ -10,9 +10,10 @@ pub const BACKEND_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    WifiScanStateChanged(bool),
     WifiNetworksUpdated(Vec<WifiNetwork>),
     InterfacesUpdated(Vec<NetworkInterface>),
-    ConnectionStatus(String),
+    ActionCompleted(Result<String, String>),
     Error(String),
 }
 
@@ -34,11 +35,15 @@ pub struct App {
     backend_event_tx: mpsc::Sender<BackendEvent>,
     backend_event_rx: mpsc::Receiver<BackendEvent>,
     wifi_list_state: ListState,
+    wifi_scanning: bool,
+    is_busy: bool,
+    action_in_flight: bool,
     input_mode: InputMode,
     input_buffer: String,
     should_quit: bool,
     status_message: String,
     last_error: Option<String>,
+    logs: Vec<String>,
 }
 
 impl App {
@@ -51,11 +56,15 @@ impl App {
             backend_event_tx,
             backend_event_rx,
             wifi_list_state: ListState::default(),
+            wifi_scanning: false,
+            is_busy: false,
+            action_in_flight: false,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             should_quit: false,
             status_message: "Waiting for backend updates".into(),
             last_error: None,
+            logs: Vec::new(),
         }
     }
 
@@ -69,20 +78,39 @@ impl App {
 
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
         match event {
+            BackendEvent::WifiScanStateChanged(scanning) => {
+                self.wifi_scanning = scanning;
+                self.update_busy_state();
+            }
             BackendEvent::WifiNetworksUpdated(networks) => {
                 self.wifi_networks = networks;
                 self.normalize_wifi_selection();
-                self.last_error = None;
             }
             BackendEvent::InterfacesUpdated(interfaces) => {
                 self.interfaces = interfaces;
-                self.last_error = None;
             }
-            BackendEvent::ConnectionStatus(status) => {
-                self.status_message = status;
-                self.last_error = None;
+            BackendEvent::ActionCompleted(result) => {
+                self.action_in_flight = false;
+                self.update_busy_state();
+
+                match result {
+                    Ok(status) => {
+                        self.status_message = status.clone();
+                        self.last_error = None;
+                        self.add_log(status);
+                    }
+                    Err(error) => {
+                        let message = format!("Error: {error}");
+                        self.last_error = Some(message.clone());
+                        self.add_log(message);
+                    }
+                }
             }
-            BackendEvent::Error(error) => self.last_error = Some(format!("Error: {error}")),
+            BackendEvent::Error(error) => {
+                let message = format!("Error: {error}");
+                self.last_error = Some(message.clone());
+                self.add_log(message);
+            }
         }
     }
 
@@ -141,7 +169,7 @@ impl App {
             return Some(SelectedNetworkAction::Disconnect { ssid: network.ssid });
         }
 
-        if !network.secure || matches!(network.security, WifiSecurity::Open) {
+        if network.is_known || !network.secure || matches!(network.security, WifiSecurity::Open) {
             self.status_message = format!("Connecting to {}...", network.ssid);
             return Some(SelectedNetworkAction::Connect {
                 ssid: network.ssid,
@@ -223,6 +251,40 @@ impl App {
         self.last_error.is_some()
     }
 
+    pub fn logs(&self) -> &[String] {
+        &self.logs
+    }
+
+    pub fn add_log(&mut self, message: String) {
+        self.logs.push(message);
+        if self.logs.len() > 5 {
+            self.logs.remove(0);
+        }
+    }
+
+    pub fn wifi_scanning(&self) -> bool {
+        self.wifi_scanning
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.is_busy
+    }
+
+    pub fn begin_backend_action(&mut self) -> bool {
+        if self.is_busy {
+            self.show_wait_message();
+            return false;
+        }
+
+        self.action_in_flight = true;
+        self.update_busy_state();
+        true
+    }
+
+    pub fn show_wait_message(&mut self) {
+        self.status_message = "Please wait...".into();
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -243,5 +305,9 @@ impl App {
             .unwrap_or(0)
             .min(self.wifi_networks.len() - 1);
         self.wifi_list_state.select(Some(selected));
+    }
+
+    fn update_busy_state(&mut self) {
+        self.is_busy = self.wifi_scanning || self.action_in_flight;
     }
 }

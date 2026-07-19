@@ -22,6 +22,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use tokio::time::MissedTickBehavior;
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -66,15 +67,17 @@ async fn start_backends(app: &App) {
 }
 
 async fn run_app(terminal: &mut Tui, mut app: App) -> Result<(), Box<dyn Error>> {
-    while !app.should_quit() {
-        terminal.draw(|frame| render(frame, &mut app))?;
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    while !app.should_quit() {
         tokio::select! {
             Some(event) = app.recv_backend_event() => app.apply_backend_event(event),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            _ = tick.tick() => {
                 while event::poll(Duration::ZERO)? {
                     handle_terminal_event(&mut app, event::read()?);
                 }
+                terminal.draw(|frame| render(frame, &mut app))?;
             }
         }
     }
@@ -96,6 +99,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
         if matches!(app.input_mode(), InputMode::Input { .. }) {
             match key.code {
                 KeyCode::Esc => app.cancel_password_input(),
+                KeyCode::Enter if app.is_busy() => app.show_wait_message(),
                 KeyCode::Enter => submit_connection(app),
                 KeyCode::Backspace => app.delete_input_character(),
                 KeyCode::Char(character) => app.push_input_character(character),
@@ -106,7 +110,9 @@ fn handle_terminal_event(app: &mut App, event: Event) {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit(),
                 KeyCode::Down | KeyCode::Char('j') => app.next_wifi_network(),
                 KeyCode::Up | KeyCode::Char('k') => app.previous_wifi_network(),
+                KeyCode::Enter if app.is_busy() => app.show_wait_message(),
                 KeyCode::Enter => toggle_selected_network(app),
+                KeyCode::Char('d' | 'D') if app.is_busy() => app.show_wait_message(),
                 KeyCode::Char('d' | 'D') => forget_selected_network(app),
                 _ => {}
             }
@@ -133,24 +139,30 @@ fn submit_connection(app: &mut App) {
 }
 
 fn start_connection(app: &mut App, ssid: String, password: String) {
+    if !app.begin_backend_action() {
+        return;
+    }
     let sender = app.backend_event_sender();
 
     tokio::spawn(async move {
         let event = match initiate_connection(ssid.clone(), password).await {
-            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Connected to {ssid}")),
-            Err(error) => app::BackendEvent::Error(error.to_string()),
+            Ok(()) => app::BackendEvent::ActionCompleted(Ok(format!("Connected to {ssid}"))),
+            Err(error) => app::BackendEvent::ActionCompleted(Err(error.to_string())),
         };
         let _ = sender.send(event).await;
     });
 }
 
 fn start_disconnection(app: &mut App, ssid: String) {
+    if !app.begin_backend_action() {
+        return;
+    }
     let sender = app.backend_event_sender();
 
     tokio::spawn(async move {
         let event = match backend_disconnect_current_network().await {
-            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Disconnected from {ssid}")),
-            Err(error) => app::BackendEvent::Error(error.to_string()),
+            Ok(()) => app::BackendEvent::ActionCompleted(Ok(format!("Disconnected from {ssid}"))),
+            Err(error) => app::BackendEvent::ActionCompleted(Err(error.to_string())),
         };
         let _ = sender.send(event).await;
     });
@@ -160,20 +172,23 @@ fn forget_selected_network(app: &mut App) {
     let Some(ssid) = app.forget_selected_network() else {
         return;
     };
+    if !app.begin_backend_action() {
+        return;
+    }
     let sender = app.backend_event_sender();
 
     tokio::spawn(async move {
         let event = match forget_network(ssid.clone()).await {
-            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Network {ssid} forgotten")),
-            Err(error) => app::BackendEvent::Error(error.to_string()),
+            Ok(()) => app::BackendEvent::ActionCompleted(Ok(format!("Network {ssid} forgotten"))),
+            Err(error) => app::BackendEvent::ActionCompleted(Err(error.to_string())),
         };
         let _ = sender.send(event).await;
     });
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
-    let [content_area, status_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let [content_area, footer_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(frame.area());
     let [wifi_area, interface_area] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .areas(content_area);
@@ -181,36 +196,58 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_wifi_networks(frame, app, wifi_area);
     render_interfaces(frame, app, interface_area);
 
-    let status_color = if app.status_is_error() {
+    let status_color = if app.wifi_scanning() {
+        Color::Cyan
+    } else if app.status_is_error() {
         Color::Red
     } else {
         Color::Yellow
     };
-    let key_hints = if matches!(app.input_mode(), InputMode::Input { .. }) {
-        "  |  Enter connect  Esc cancel"
+    let status_message = if app.wifi_scanning() {
+        "Scanning..."
     } else {
-        "  |  q/Esc/Ctrl+C quit  Up/Down or j/k select  Enter connect/disconnect  d forget"
+        app.status_message()
+    };
+    let key_hints = if matches!(app.input_mode(), InputMode::Input { .. }) {
+        "Enter connect  Esc cancel"
+    } else {
+        "q/Esc/Ctrl+C quit  Up/Down or j/k select  Enter connect/disconnect  d forget"
     };
     let status = Line::from(vec![
         Span::styled(
-            format!(" {}", app.status_message()),
+            format!("{status_message}  |  "),
             Style::default().fg(status_color),
         ),
         Span::styled(key_hints, Style::default().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(Paragraph::new(status), status_area);
+    let mut footer_items = vec![ListItem::new(status)];
+    footer_items.extend(app.logs().iter().map(|message| {
+        let color = if message.starts_with("Error:") {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+        ListItem::new(Line::styled(message.clone(), Style::default().fg(color)))
+    }));
+    let footer = List::new(footer_items).block(
+        Block::default()
+            .title(Span::styled(" Footer ", Style::default().fg(Color::Cyan)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(footer, footer_area);
 
     if matches!(app.input_mode(), InputMode::Input { .. }) {
-        render_password_input(frame, app);
+        render_password_input(frame, app, content_area);
     }
 }
 
-fn render_password_input(frame: &mut Frame, app: &App) {
+fn render_password_input(frame: &mut Frame, app: &App, content_area: Rect) {
     let InputMode::Input { ssid } = app.input_mode() else {
         return;
     };
 
-    let modal_area = password_modal_area(frame.area());
+    let modal_area = password_modal_area(content_area);
     let masked_password = "*".repeat(app.input_buffer().chars().count());
     let input_line = format!("Password: {masked_password}");
     let modal = Paragraph::new(vec![

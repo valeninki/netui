@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt::Display, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -15,6 +19,9 @@ const IWD_ROOT_PATH: &str = "/net/connman/iwd";
 const PASSWORD_AGENT_PATH: &str = "/org/netui/IwdPasswordAgent";
 const STATION_INTERFACE: &str = "net.connman.iwd.Station";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const EMPTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const SCAN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[proxy(
@@ -28,6 +35,9 @@ trait IwdStation {
 
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn scanning(&self) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -108,9 +118,48 @@ impl IwdBackend {
         let backend = self.clone();
 
         tokio::spawn(async move {
+            let mut last_scan = None;
+
             loop {
-                match backend.get_networks().await {
+                let mut scan_active = backend.is_scan_running().await.unwrap_or(false);
+                let scan_due = last_scan
+                    .map(|instant: Instant| instant.elapsed() >= SCAN_REQUEST_INTERVAL)
+                    .unwrap_or(true);
+
+                if !scan_active && scan_due {
+                    if sender
+                        .send(BackendEvent::WifiScanStateChanged(true))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_scan = Some(Instant::now());
+
+                    match backend.scan().await {
+                        Ok(()) => scan_active = true,
+                        Err(error) if scan_in_progress(&error) => scan_active = true,
+                        Err(error) => {
+                            if sender
+                                .send(BackendEvent::Error(format!(
+                                    "Wi-Fi scan request failed: {error}"
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let refresh_interval = match backend.get_networks().await {
                     Ok(networks) => {
+                        let refresh_interval = if networks.is_empty() {
+                            EMPTY_REFRESH_INTERVAL
+                        } else {
+                            REFRESH_INTERVAL
+                        };
                         if sender
                             .send(BackendEvent::WifiNetworksUpdated(networks))
                             .await
@@ -118,6 +167,7 @@ impl IwdBackend {
                         {
                             return;
                         }
+                        refresh_interval
                     }
                     Err(error) => {
                         if sender
@@ -127,10 +177,25 @@ impl IwdBackend {
                         {
                             return;
                         }
+                        RETRY_DELAY
                     }
-                }
+                };
 
-                match tokio::time::timeout(REFRESH_INTERVAL, backend.wait_for_station_change())
+                let scan_active = backend.is_scan_running().await.unwrap_or(scan_active);
+                if sender
+                    .send(BackendEvent::WifiScanStateChanged(scan_active))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let refresh_interval = if scan_active {
+                    SCAN_POLL_INTERVAL
+                } else {
+                    refresh_interval
+                };
+
+                match tokio::time::timeout(refresh_interval, backend.wait_for_station_change())
                     .await
                 {
                     Ok(Ok(())) | Err(_) => {}
@@ -204,6 +269,22 @@ impl IwdBackend {
             .map_err(dbus_error)
     }
 
+    async fn is_scan_running(&self) -> Result<bool, BackendError> {
+        for station_path in self.station_paths().await? {
+            if self
+                .station_proxy(&station_path)
+                .await?
+                .scanning()
+                .await
+                .map_err(dbus_error)?
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     async fn network_proxy(
         &self,
         path: OwnedObjectPath,
@@ -235,6 +316,33 @@ impl IwdBackend {
             .build()
             .await
             .map_err(dbus_error)
+    }
+
+    async fn known_ssids(&self) -> Result<BTreeSet<String>, BackendError> {
+        let root = self.introspect(IWD_ROOT_PATH).await?;
+        let mut known_ssids = BTreeSet::new();
+
+        for node in child_nodes(&root) {
+            let path = format!("{IWD_ROOT_PATH}/{node}");
+            let Ok(xml) = self.introspect(&path).await else {
+                continue;
+            };
+            if !exposes_interface(&xml, "net.connman.iwd.KnownNetwork") {
+                continue;
+            }
+
+            let Ok(path) = OwnedObjectPath::try_from(path) else {
+                continue;
+            };
+            let Ok(network) = self.known_network_proxy(path).await else {
+                continue;
+            };
+            if let Ok(ssid) = network.name().await {
+                known_ssids.insert(ssid);
+            }
+        }
+
+        Ok(known_ssids)
     }
 
     async fn connect_network(&self, ssid: String, password: String) -> Result<(), BackendError> {
@@ -412,18 +520,38 @@ impl WifiBackend for IwdBackend {
 
     async fn get_networks(&self) -> Result<Vec<WifiNetwork>, BackendError> {
         let mut networks = BTreeMap::new();
+        let known_ssids = self.known_ssids().await.unwrap_or_default();
 
         for station_path in self.station_paths().await? {
-            let station = self.station_proxy(&station_path).await?;
-            for (path, signal) in station.get_ordered_networks().await.map_err(dbus_error)? {
-                let network = self.network_proxy(path).await?;
-                let security = iwd_security(&network.network_type().await.map_err(dbus_error)?);
+            let Ok(station) = self.station_proxy(&station_path).await else {
+                continue;
+            };
+            let Ok(ordered_networks) = station.get_ordered_networks().await else {
+                continue;
+            };
+            for (path, signal) in ordered_networks {
+                let Ok(network) = self.network_proxy(path).await else {
+                    continue;
+                };
+                let Ok(ssid) = network.name().await else {
+                    continue;
+                };
+                let Ok(network_type) = network.network_type().await else {
+                    continue;
+                };
+                let Ok(connected) = network.connected().await else {
+                    continue;
+                };
+                let security = iwd_security(&network_type);
+                let is_known = known_ssids.contains(&ssid)
+                    || matches!(network.known_network().await, Ok(path) if path.as_str() != "/");
                 let wifi_network = WifiNetwork {
-                    ssid: network.name().await.map_err(dbus_error)?,
+                    ssid,
                     signal_strength: iwd_signal_to_percentage(signal),
                     security,
                     secure: security.is_secure(),
-                    connected: network.connected().await.map_err(dbus_error)?,
+                    connected,
+                    is_known,
                 };
 
                 merge_network(&mut networks, wifi_network);
@@ -486,6 +614,7 @@ fn merge_network(networks: &mut BTreeMap<String, WifiNetwork>, network: WifiNetw
         .and_modify(|existing| {
             existing.signal_strength = existing.signal_strength.max(network.signal_strength);
             existing.connected |= network.connected;
+            existing.is_known |= network.is_known;
             if network.connected || !existing.secure {
                 existing.security = network.security;
                 existing.secure = network.secure;
@@ -496,4 +625,8 @@ fn merge_network(networks: &mut BTreeMap<String, WifiNetwork>, network: WifiNetw
 
 fn dbus_error(error: impl Display) -> BackendError {
     BackendError::Operation(error.to_string())
+}
+
+fn scan_in_progress(error: &BackendError) -> bool {
+    matches!(error, BackendError::Operation(message) if message.contains("InProgress"))
 }

@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, collections::HashMap, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -16,6 +21,9 @@ pub const WPA_SUPPLICANT_SERVICE: &str = "fi.w1.wpa_supplicant1";
 
 const WPA_SUPPLICANT_PATH: &str = "/fi/w1/wpa_supplicant1";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const EMPTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const SCAN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[proxy(
@@ -53,6 +61,9 @@ trait WpaInterface {
 
     #[zbus(property, name = "Networks")]
     fn networks(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    #[zbus(property)]
+    fn scanning(&self) -> zbus::Result<bool>;
 
     fn remove_network(&self, network: OwnedObjectPath) -> zbus::Result<()>;
     fn save_config(&self) -> zbus::Result<()>;
@@ -120,9 +131,48 @@ impl WpaSupplicantBackend {
         let backend = self.clone();
 
         tokio::spawn(async move {
+            let mut last_scan = None;
+
             loop {
-                match backend.get_networks().await {
+                let mut scan_active = backend.is_scan_running().await.unwrap_or(false);
+                let scan_due = last_scan
+                    .map(|instant: Instant| instant.elapsed() >= SCAN_REQUEST_INTERVAL)
+                    .unwrap_or(true);
+
+                if !scan_active && scan_due {
+                    if sender
+                        .send(BackendEvent::WifiScanStateChanged(true))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_scan = Some(Instant::now());
+
+                    match backend.scan().await {
+                        Ok(()) => scan_active = true,
+                        Err(error) if scan_in_progress(&error) => scan_active = true,
+                        Err(error) => {
+                            if sender
+                                .send(BackendEvent::Error(format!(
+                                    "Wi-Fi scan request failed: {error}"
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let refresh_interval = match backend.get_networks().await {
                     Ok(networks) => {
+                        let refresh_interval = if networks.is_empty() {
+                            EMPTY_REFRESH_INTERVAL
+                        } else {
+                            REFRESH_INTERVAL
+                        };
                         if sender
                             .send(BackendEvent::WifiNetworksUpdated(networks))
                             .await
@@ -130,6 +180,7 @@ impl WpaSupplicantBackend {
                         {
                             return;
                         }
+                        refresh_interval
                     }
                     Err(error) => {
                         if sender
@@ -139,10 +190,25 @@ impl WpaSupplicantBackend {
                         {
                             return;
                         }
+                        RETRY_DELAY
                     }
-                }
+                };
 
-                match tokio::time::timeout(REFRESH_INTERVAL, backend.wait_for_change()).await {
+                let scan_active = backend.is_scan_running().await.unwrap_or(scan_active);
+                if sender
+                    .send(BackendEvent::WifiScanStateChanged(scan_active))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let refresh_interval = if scan_active {
+                    SCAN_POLL_INTERVAL
+                } else {
+                    refresh_interval
+                };
+
+                match tokio::time::timeout(refresh_interval, backend.wait_for_change()).await {
                     Ok(Ok(())) | Err(_) => {}
                     Ok(Err(error)) => {
                         if sender
@@ -199,6 +265,24 @@ impl WpaSupplicantBackend {
             .build()
             .await
             .map_err(dbus_error)
+    }
+
+    async fn is_scan_running(&self) -> Result<bool, BackendError> {
+        let manager = self.manager_proxy().await?;
+
+        for path in manager.interfaces().await.map_err(dbus_error)? {
+            if self
+                .interface_proxy(path)
+                .await?
+                .scanning()
+                .await
+                .map_err(dbus_error)?
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     async fn forget_network_profile(&self, ssid: String) -> Result<(), BackendError> {
@@ -296,20 +380,46 @@ impl WifiBackend for WpaSupplicantBackend {
 
         for interface_path in manager.interfaces().await.map_err(dbus_error)? {
             let interface = self.interface_proxy(interface_path).await?;
-            let current_bss = interface.current_bss().await.map_err(dbus_error)?;
+            let current_bss = interface.current_bss().await.ok();
+            let mut known_ssids = BTreeSet::new();
 
-            for path in interface.bsses().await.map_err(dbus_error)? {
-                let connected = path == current_bss;
-                let bss = self.bss_proxy(path).await?;
-                let security = wpa_security(
-                    &bss.wpa().await.map_err(dbus_error)?,
-                    &bss.rsn().await.map_err(dbus_error)?,
-                    bss.privacy().await.map_err(dbus_error)?,
-                );
-                let ssid = String::from_utf8_lossy(&bss.ssid().await.map_err(dbus_error)?).into();
+            if let Ok(network_paths) = interface.networks().await {
+                for network_path in network_paths {
+                    let Ok(network) = self.network_proxy(network_path).await else {
+                        continue;
+                    };
+                    let Ok(properties) = network.properties().await else {
+                        continue;
+                    };
+                    if let Some(ssid) = configured_ssid(&properties) {
+                        known_ssids.insert(ssid);
+                    }
+                }
+            }
+
+            let Ok(bss_paths) = interface.bsses().await else {
+                continue;
+            };
+            for path in bss_paths {
+                let connected = current_bss.as_ref() == Some(&path);
+                let Ok(bss) = self.bss_proxy(path).await else {
+                    continue;
+                };
+                let (Ok(wpa), Ok(rsn), Ok(privacy), Ok(ssid), Ok(signal)) = (
+                    bss.wpa().await,
+                    bss.rsn().await,
+                    bss.privacy().await,
+                    bss.ssid().await,
+                    bss.signal().await,
+                ) else {
+                    continue;
+                };
+                let security = wpa_security(&wpa, &rsn, privacy);
+                let ssid = String::from_utf8_lossy(&ssid).into_owned();
                 let wifi_network = WifiNetwork {
+                    is_known: known_ssids.contains(&ssid),
                     ssid,
-                    signal_strength: dbm_to_percentage(bss.signal().await.map_err(dbus_error)?),
+                    signal_strength: dbm_to_percentage(signal),
                     security,
                     secure: security.is_secure(),
                     connected,
@@ -407,6 +517,7 @@ fn merge_network(networks: &mut BTreeMap<String, WifiNetwork>, network: WifiNetw
         .and_modify(|existing| {
             existing.signal_strength = existing.signal_strength.max(network.signal_strength);
             existing.connected |= network.connected;
+            existing.is_known |= network.is_known;
             if network.connected || !existing.secure {
                 existing.security = network.security;
                 existing.secure = network.secure;
@@ -417,4 +528,8 @@ fn merge_network(networks: &mut BTreeMap<String, WifiNetwork>, network: WifiNetw
 
 fn dbus_error(error: zbus::Error) -> BackendError {
     BackendError::Operation(error.to_string())
+}
+
+fn scan_in_progress(error: &BackendError) -> bool {
+    matches!(error, BackendError::Operation(message) if message.contains("InProgress"))
 }

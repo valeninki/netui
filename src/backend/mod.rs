@@ -17,6 +17,7 @@ pub struct WifiNetwork {
     pub security: WifiSecurity,
     pub secure: bool,
     pub connected: bool,
+    pub is_known: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
