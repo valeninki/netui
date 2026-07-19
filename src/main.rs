@@ -27,8 +27,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let app = App::new();
     start_backends(&app).await;
     let result = run_app(&mut terminal, app).await;
-    restore_terminal(&mut terminal)?;
-    result
+    let restore_result = restore_terminal(&mut terminal);
+
+    result?;
+    restore_result?;
+    Ok(())
 }
 
 async fn start_backends(app: &App) {
@@ -258,12 +261,23 @@ fn operational_state_label(state: OperationalState) -> &'static str {
 fn init_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
+
+    Terminal::new(CrosstermBackend::new(stdout)).inspect_err(|_| {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    })
 }
 
 fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()
+    let raw_mode_result = disable_raw_mode();
+    let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let cursor_result = terminal.show_cursor();
+
+    raw_mode_result?;
+    screen_result?;
+    cursor_result
 }

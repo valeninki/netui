@@ -5,6 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
+    flake-compat = {
+      url = "github:edolstra/flake-compat/b4a34015c698c7793d592d66adbab377907a2be8";
+      flake = false;
+    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -24,6 +28,7 @@
           pname = "netui";
           version = "0.1.0";
           src = craneLib.cleanCargoSource ./.;
+          cargoVendorDir = null;
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.dbus ];
         };
@@ -39,6 +44,7 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.gcc
             pkgs.pkg-config
             pkgs.dbus
           ];

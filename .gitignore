@@ -2,8 +2,6 @@
 /target/
 *.rs.bk
 *.pdb
-
-# Dependency locking is handled by flake.lock.
 /Cargo.lock
 
 # Nix
