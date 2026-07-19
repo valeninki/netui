@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fmt::Display, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::mpsc, task::JoinHandle};
-use zbus::{Connection, fdo::PropertiesProxy, proxy, zvariant::OwnedObjectPath};
+use zbus::{Connection, fdo::PropertiesProxy, interface, proxy, zvariant::OwnedObjectPath};
 
 use crate::app::BackendEvent;
 
@@ -12,6 +12,7 @@ use super::{BackendError, WifiBackend, WifiNetwork, WifiSecurity};
 pub const IWD_SERVICE: &str = "net.connman.iwd";
 
 const IWD_ROOT_PATH: &str = "/net/connman/iwd";
+const PASSWORD_AGENT_PATH: &str = "/org/netui/IwdPasswordAgent";
 const STATION_INTERFACE: &str = "net.connman.iwd.Station";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -22,7 +23,11 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 )]
 trait IwdStation {
     fn scan(&self) -> zbus::Result<()>;
+    fn disconnect(&self) -> zbus::Result<()>;
     fn get_ordered_networks(&self) -> zbus::Result<Vec<(OwnedObjectPath, i16)>>;
+
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<String>;
 }
 
 #[proxy(
@@ -30,6 +35,8 @@ trait IwdStation {
     default_service = "net.connman.iwd"
 )]
 trait IwdNetwork {
+    fn connect(&self) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
 
@@ -38,6 +45,29 @@ trait IwdNetwork {
 
     #[zbus(property)]
     fn connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property, name = "KnownNetwork")]
+    fn known_network(&self) -> zbus::Result<OwnedObjectPath>;
+}
+
+#[proxy(
+    interface = "net.connman.iwd.KnownNetwork",
+    default_service = "net.connman.iwd"
+)]
+trait IwdKnownNetwork {
+    fn forget(&self) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn name(&self) -> zbus::Result<String>;
+}
+
+#[proxy(
+    interface = "net.connman.iwd.AgentManager",
+    default_service = "net.connman.iwd"
+)]
+trait IwdAgentManager {
+    fn register_agent(&self, path: OwnedObjectPath) -> zbus::Result<()>;
+    fn unregister_agent(&self, path: OwnedObjectPath) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -46,6 +76,17 @@ trait IwdNetwork {
 )]
 trait Introspectable {
     fn introspect(&self) -> zbus::Result<String>;
+}
+
+struct PasswordAgent {
+    password: String,
+}
+
+#[interface(name = "net.connman.iwd.Agent")]
+impl PasswordAgent {
+    async fn request_passphrase(&self, _network: OwnedObjectPath) -> String {
+        self.password.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -175,6 +216,149 @@ impl IwdBackend {
             .map_err(dbus_error)
     }
 
+    async fn agent_manager_proxy(&self) -> Result<IwdAgentManagerProxy<'_>, BackendError> {
+        IwdAgentManagerProxy::builder(&self.connection)
+            .path(IWD_ROOT_PATH)
+            .map_err(dbus_error)?
+            .build()
+            .await
+            .map_err(dbus_error)
+    }
+
+    async fn known_network_proxy(
+        &self,
+        path: OwnedObjectPath,
+    ) -> Result<IwdKnownNetworkProxy<'_>, BackendError> {
+        IwdKnownNetworkProxy::builder(&self.connection)
+            .path(path)
+            .map_err(dbus_error)?
+            .build()
+            .await
+            .map_err(dbus_error)
+    }
+
+    async fn connect_network(&self, ssid: String, password: String) -> Result<(), BackendError> {
+        let mut target_network = None;
+
+        for station_path in self.station_paths().await? {
+            let station = self.station_proxy(&station_path).await?;
+            for (path, _) in station.get_ordered_networks().await.map_err(dbus_error)? {
+                let network = self.network_proxy(path.clone()).await?;
+                if network.name().await.map_err(dbus_error)? == ssid {
+                    target_network = Some(network);
+                    break;
+                }
+            }
+
+            if target_network.is_some() {
+                break;
+            }
+        }
+
+        let Some(network) = target_network else {
+            return Err(BackendError::Unavailable(format!(
+                "Wi-Fi network {ssid:?} is no longer available"
+            )));
+        };
+
+        if network.network_type().await.map_err(dbus_error)? == "8021x" {
+            return Err(BackendError::Unavailable(
+                "enterprise Wi-Fi authentication is not implemented".into(),
+            ));
+        }
+
+        let agent_path = OwnedObjectPath::try_from(PASSWORD_AGENT_PATH).map_err(dbus_error)?;
+        let agent_manager = self.agent_manager_proxy().await?;
+        self.connection
+            .object_server()
+            .at(PASSWORD_AGENT_PATH, PasswordAgent { password })
+            .await
+            .map_err(dbus_error)?;
+
+        if let Err(error) = agent_manager.register_agent(agent_path.clone()).await {
+            let _ = self
+                .connection
+                .object_server()
+                .remove::<PasswordAgent, _>(PASSWORD_AGENT_PATH)
+                .await;
+            return Err(dbus_error(error));
+        }
+
+        let connect_result = network.connect().await.map_err(dbus_error);
+        let unregister_result = agent_manager
+            .unregister_agent(agent_path)
+            .await
+            .map_err(dbus_error);
+        let remove_result = self
+            .connection
+            .object_server()
+            .remove::<PasswordAgent, _>(PASSWORD_AGENT_PATH)
+            .await
+            .map(|_| ())
+            .map_err(dbus_error);
+
+        connect_result?;
+        unregister_result?;
+        remove_result
+    }
+
+    async fn disconnect_connected_network(&self) -> Result<(), BackendError> {
+        for station_path in self.station_paths().await? {
+            let station = self.station_proxy(&station_path).await?;
+            let state = station.state().await.map_err(dbus_error)?;
+            if matches!(state.as_str(), "connected" | "connecting") {
+                return station.disconnect().await.map_err(dbus_error);
+            }
+        }
+
+        Err(BackendError::Unavailable(
+            "iwd has no connected Wi-Fi network".into(),
+        ))
+    }
+
+    async fn forget_network_profile(&self, ssid: String) -> Result<(), BackendError> {
+        for station_path in self.station_paths().await? {
+            let station = self.station_proxy(&station_path).await?;
+            for (path, _) in station.get_ordered_networks().await.map_err(dbus_error)? {
+                let network = self.network_proxy(path).await?;
+                if network.name().await.map_err(dbus_error)? != ssid {
+                    continue;
+                }
+
+                let known_path = network.known_network().await.map_err(dbus_error)?;
+                if known_path.as_str() != "/" {
+                    return self
+                        .known_network_proxy(known_path)
+                        .await?
+                        .forget()
+                        .await
+                        .map_err(dbus_error);
+                }
+            }
+        }
+
+        let root = self.introspect(IWD_ROOT_PATH).await?;
+        for node in child_nodes(&root) {
+            let path = format!("{IWD_ROOT_PATH}/{node}");
+            let Ok(xml) = self.introspect(&path).await else {
+                continue;
+            };
+            if !exposes_interface(&xml, "net.connman.iwd.KnownNetwork") {
+                continue;
+            }
+
+            let path = OwnedObjectPath::try_from(path).map_err(dbus_error)?;
+            let network = self.known_network_proxy(path).await?;
+            if network.name().await.map_err(dbus_error)? == ssid {
+                return network.forget().await.map_err(dbus_error);
+            }
+        }
+
+        Err(BackendError::Unavailable(format!(
+            "no saved profile exists for Wi-Fi network {ssid:?}"
+        )))
+    }
+
     async fn wait_for_station_change(&self) -> Result<(), BackendError> {
         let mut changes = FuturesUnordered::new();
 
@@ -248,6 +432,22 @@ impl WifiBackend for IwdBackend {
 
         Ok(networks.into_values().collect())
     }
+
+    async fn initiate_connection(
+        &self,
+        ssid: String,
+        password: String,
+    ) -> Result<(), BackendError> {
+        self.connect_network(ssid, password).await
+    }
+
+    async fn disconnect_current_network(&self) -> Result<(), BackendError> {
+        self.disconnect_connected_network().await
+    }
+
+    async fn forget_network(&self, ssid: String) -> Result<(), BackendError> {
+        self.forget_network_profile(ssid).await
+    }
 }
 
 fn child_nodes(xml: &str) -> Vec<&str> {
@@ -294,6 +494,6 @@ fn merge_network(networks: &mut BTreeMap<String, WifiNetwork>, network: WifiNetw
         .or_insert(network);
 }
 
-fn dbus_error(error: zbus::Error) -> BackendError {
+fn dbus_error(error: impl Display) -> BackendError {
     BackendError::Operation(error.to_string())
 }

@@ -66,6 +66,10 @@ pub enum BackendError {
 pub trait WifiBackend: Send + Sync {
     async fn scan(&self) -> Result<(), BackendError>;
     async fn get_networks(&self) -> Result<Vec<WifiNetwork>, BackendError>;
+    async fn initiate_connection(&self, ssid: String, password: String)
+    -> Result<(), BackendError>;
+    async fn disconnect_current_network(&self) -> Result<(), BackendError>;
+    async fn forget_network(&self, ssid: String) -> Result<(), BackendError>;
 }
 
 #[async_trait]
@@ -89,6 +93,36 @@ impl ActiveWifiBackend {
     }
 }
 
+pub async fn initiate_connection(ssid: String, password: String) -> Result<(), BackendError> {
+    let Some(backend) = detect_wifi_backend().await? else {
+        return Err(BackendError::Unavailable(
+            "neither iwd nor wpa_supplicant is running".into(),
+        ));
+    };
+
+    backend.initiate_connection(ssid, password).await
+}
+
+pub async fn disconnect_current_network() -> Result<(), BackendError> {
+    let Some(backend) = detect_wifi_backend().await? else {
+        return Err(BackendError::Unavailable(
+            "neither iwd nor wpa_supplicant is running".into(),
+        ));
+    };
+
+    backend.disconnect_current_network().await
+}
+
+pub async fn forget_network(ssid: String) -> Result<(), BackendError> {
+    let Some(backend) = detect_wifi_backend().await? else {
+        return Err(BackendError::Unavailable(
+            "neither iwd nor wpa_supplicant is running".into(),
+        ));
+    };
+
+    backend.forget_network(ssid).await
+}
+
 #[async_trait]
 impl WifiBackend for ActiveWifiBackend {
     async fn scan(&self) -> Result<(), BackendError> {
@@ -102,6 +136,31 @@ impl WifiBackend for ActiveWifiBackend {
         match self {
             Self::Iwd(backend) => backend.get_networks().await,
             Self::WpaSupplicant(backend) => backend.get_networks().await,
+        }
+    }
+
+    async fn initiate_connection(
+        &self,
+        ssid: String,
+        password: String,
+    ) -> Result<(), BackendError> {
+        match self {
+            Self::Iwd(backend) => backend.initiate_connection(ssid, password).await,
+            Self::WpaSupplicant(backend) => backend.initiate_connection(ssid, password).await,
+        }
+    }
+
+    async fn disconnect_current_network(&self) -> Result<(), BackendError> {
+        match self {
+            Self::Iwd(backend) => backend.disconnect_current_network().await,
+            Self::WpaSupplicant(backend) => backend.disconnect_current_network().await,
+        }
+    }
+
+    async fn forget_network(&self, ssid: String) -> Result<(), BackendError> {
+        match self {
+            Self::Iwd(backend) => backend.forget_network(ssid).await,
+            Self::WpaSupplicant(backend) => backend.forget_network(ssid).await,
         }
     }
 }

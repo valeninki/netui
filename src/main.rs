@@ -3,20 +3,24 @@ mod backend;
 
 use std::{error::Error, io, time::Duration};
 
-use app::App;
-use backend::{OperationalState, WifiSecurity, detect_wifi_backend, networkd::NetworkdDbus};
+use app::{App, InputMode, SelectedNetworkAction};
+use backend::{
+    OperationalState, WifiSecurity, detect_wifi_backend,
+    disconnect_current_network as backend_disconnect_current_network, forget_network,
+    initiate_connection, networkd::NetworkdDbus,
+};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
@@ -82,14 +86,89 @@ fn handle_terminal_event(app: &mut App, event: Event) {
     if let Event::Key(key) = event
         && key.kind == KeyEventKind::Press
     {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-            KeyCode::Down | KeyCode::Char('j') => app.next_wifi_network(),
-            KeyCode::Up | KeyCode::Char('k') => app.previous_wifi_network(),
-            KeyCode::Enter => app.connect_selected_wifi_network(),
-            _ => {}
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
+            app.quit();
+            return;
+        }
+
+        if matches!(app.input_mode(), InputMode::Input { .. }) {
+            match key.code {
+                KeyCode::Esc => app.cancel_password_input(),
+                KeyCode::Enter => submit_connection(app),
+                KeyCode::Backspace => app.delete_input_character(),
+                KeyCode::Char(character) => app.push_input_character(character),
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+                KeyCode::Down | KeyCode::Char('j') => app.next_wifi_network(),
+                KeyCode::Up | KeyCode::Char('k') => app.previous_wifi_network(),
+                KeyCode::Enter => toggle_selected_network(app),
+                KeyCode::Char('d' | 'D') => forget_selected_network(app),
+                _ => {}
+            }
         }
     }
+}
+
+fn toggle_selected_network(app: &mut App) {
+    match app.toggle_selected_network() {
+        Some(SelectedNetworkAction::Connect { ssid, password }) => {
+            start_connection(app, ssid, password);
+        }
+        Some(SelectedNetworkAction::Disconnect { ssid }) => start_disconnection(app, ssid),
+        None => {}
+    }
+}
+
+fn submit_connection(app: &mut App) {
+    let Some((ssid, password)) = app.submit_password() else {
+        return;
+    };
+
+    start_connection(app, ssid, password);
+}
+
+fn start_connection(app: &mut App, ssid: String, password: String) {
+    let sender = app.backend_event_sender();
+
+    tokio::spawn(async move {
+        let event = match initiate_connection(ssid.clone(), password).await {
+            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Connected to {ssid}")),
+            Err(error) => app::BackendEvent::Error(error.to_string()),
+        };
+        let _ = sender.send(event).await;
+    });
+}
+
+fn start_disconnection(app: &mut App, ssid: String) {
+    let sender = app.backend_event_sender();
+
+    tokio::spawn(async move {
+        let event = match backend_disconnect_current_network().await {
+            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Disconnected from {ssid}")),
+            Err(error) => app::BackendEvent::Error(error.to_string()),
+        };
+        let _ = sender.send(event).await;
+    });
+}
+
+fn forget_selected_network(app: &mut App) {
+    let Some(ssid) = app.forget_selected_network() else {
+        return;
+    };
+    let sender = app.backend_event_sender();
+
+    tokio::spawn(async move {
+        let event = match forget_network(ssid.clone()).await {
+            Ok(()) => app::BackendEvent::ConnectionStatus(format!("Network {ssid} forgotten")),
+            Err(error) => app::BackendEvent::Error(error.to_string()),
+        };
+        let _ = sender.send(event).await;
+    });
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
@@ -107,17 +186,76 @@ fn render(frame: &mut Frame, app: &mut App) {
     } else {
         Color::Yellow
     };
+    let key_hints = if matches!(app.input_mode(), InputMode::Input { .. }) {
+        "  |  Enter connect  Esc cancel"
+    } else {
+        "  |  q/Esc/Ctrl+C quit  Up/Down or j/k select  Enter connect/disconnect  d forget"
+    };
     let status = Line::from(vec![
         Span::styled(
             format!(" {}", app.status_message()),
             Style::default().fg(status_color),
         ),
-        Span::styled(
-            "  |  q/Esc quit  Up/Down or j/k select  Enter connect",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(key_hints, Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(status), status_area);
+
+    if matches!(app.input_mode(), InputMode::Input { .. }) {
+        render_password_input(frame, app);
+    }
+}
+
+fn render_password_input(frame: &mut Frame, app: &App) {
+    let InputMode::Input { ssid } = app.input_mode() else {
+        return;
+    };
+
+    let modal_area = password_modal_area(frame.area());
+    let masked_password = "*".repeat(app.input_buffer().chars().count());
+    let input_line = format!("Password: {masked_password}");
+    let modal = Paragraph::new(vec![
+        Line::from(input_line.clone()),
+        Line::styled(
+            "Enter to connect, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .block(
+        Block::default()
+            .title(Span::styled(
+                format!(" Password for {ssid} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(modal, modal_area);
+
+    let cursor_x = modal_area
+        .x
+        .saturating_add(1)
+        .saturating_add(input_line.len() as u16)
+        .min(
+            modal_area
+                .x
+                .saturating_add(modal_area.width.saturating_sub(2)),
+        );
+    frame.set_cursor_position(Position::new(cursor_x, modal_area.y.saturating_add(1)));
+}
+
+fn password_modal_area(area: Rect) -> Rect {
+    let width = area.width.min(60);
+    let height = 4.min(area.height);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height).saturating_sub(2));
+
+    Rect::new(x, y, width, height)
 }
 
 fn render_wifi_networks(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {

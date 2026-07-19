@@ -51,6 +51,12 @@ trait WpaInterface {
     #[zbus(property, name = "CurrentBSS")]
     fn current_bss(&self) -> zbus::Result<OwnedObjectPath>;
 
+    #[zbus(property, name = "Networks")]
+    fn networks(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    fn remove_network(&self, network: OwnedObjectPath) -> zbus::Result<()>;
+    fn save_config(&self) -> zbus::Result<()>;
+
     #[zbus(signal)]
     fn scan_done(&self, success: bool) -> zbus::Result<()>;
 
@@ -84,6 +90,15 @@ trait WpaBss {
 
     #[zbus(property, name = "RSN")]
     fn rsn(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+}
+
+#[proxy(
+    interface = "fi.w1.wpa_supplicant1.Network",
+    default_service = "fi.w1.wpa_supplicant1"
+)]
+trait WpaNetwork {
+    #[zbus(property, name = "Properties")]
+    fn properties(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 }
 
 #[derive(Clone)]
@@ -172,6 +187,43 @@ impl WpaSupplicantBackend {
             .build()
             .await
             .map_err(dbus_error)
+    }
+
+    async fn network_proxy(
+        &self,
+        path: OwnedObjectPath,
+    ) -> Result<WpaNetworkProxy<'_>, BackendError> {
+        WpaNetworkProxy::builder(&self.connection)
+            .path(path)
+            .map_err(dbus_error)?
+            .build()
+            .await
+            .map_err(dbus_error)
+    }
+
+    async fn forget_network_profile(&self, ssid: String) -> Result<(), BackendError> {
+        let manager = self.manager_proxy().await?;
+
+        for interface_path in manager.interfaces().await.map_err(dbus_error)? {
+            let interface = self.interface_proxy(interface_path).await?;
+            for network_path in interface.networks().await.map_err(dbus_error)? {
+                let network = self.network_proxy(network_path.clone()).await?;
+                let properties = network.properties().await.map_err(dbus_error)?;
+                if configured_ssid(&properties).as_deref() != Some(ssid.as_str()) {
+                    continue;
+                }
+
+                interface
+                    .remove_network(network_path)
+                    .await
+                    .map_err(dbus_error)?;
+                return interface.save_config().await.map_err(dbus_error);
+            }
+        }
+
+        Err(BackendError::Unavailable(format!(
+            "no saved profile exists for Wi-Fi network {ssid:?}"
+        )))
     }
 
     async fn wait_for_change(&self) -> Result<(), BackendError> {
@@ -269,6 +321,63 @@ impl WifiBackend for WpaSupplicantBackend {
 
         Ok(networks.into_values().collect())
     }
+
+    async fn initiate_connection(
+        &self,
+        _ssid: String,
+        _password: String,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unavailable(
+            "wpa_supplicant connection requests are not implemented yet".into(),
+        ))
+    }
+
+    async fn disconnect_current_network(&self) -> Result<(), BackendError> {
+        Err(BackendError::Unavailable(
+            "wpa_supplicant disconnection requests are not implemented yet".into(),
+        ))
+    }
+
+    async fn forget_network(&self, _ssid: String) -> Result<(), BackendError> {
+        self.forget_network_profile(_ssid).await
+    }
+}
+
+fn configured_ssid(properties: &HashMap<String, OwnedValue>) -> Option<String> {
+    let ssid = String::try_from(properties.get("ssid")?.clone()).ok()?;
+    let ssid = ssid.trim();
+
+    if let Some(ssid) = ssid
+        .strip_prefix('"')
+        .and_then(|ssid| ssid.strip_suffix('"'))
+    {
+        return unescape_wpa_string(ssid);
+    }
+
+    Some(ssid.to_owned())
+}
+
+fn unescape_wpa_string(value: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut characters = value.chars();
+
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+
+        match characters.next()? {
+            '\\' => output.push('\\'),
+            '"' => output.push('"'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            other => output.push(other),
+        }
+    }
+
+    Some(output)
 }
 
 fn dbm_to_percentage(dbm: i16) -> u8 {
