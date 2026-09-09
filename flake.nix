@@ -15,39 +15,73 @@
     };
   };
 
-  outputs = { nixpkgs, flake-utils, crane, rust-overlay, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ rust-overlay.overlays.default ];
-        };
-        rustToolchain = pkgs.rust-bin.stable.latest.default;
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-        netui = craneLib.buildPackage {
-          pname = "netui";
-          version = "0.1.0";
-          src = craneLib.cleanCargoSource ./.;
-          cargoVendorDir = null;
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.dbus ];
-        };
-      in
-      {
-        packages = {
-          default = netui;
-          netui = netui;
-        };
+  outputs = { self, nixpkgs, flake-utils, crane, rust-overlay, ... }:
+    let
+      nixosModule =
+        { config, lib, pkgs, ... }:
+        let
+          cfg = config.programs.netui;
+        in
+        {
+          options.programs.netui = {
+            enable = lib.mkEnableOption "netui terminal network manager";
 
-        devShells.default = craneLib.devShell {
-          inputsFrom = [ netui ];
-          packages = [
-            rustToolchain
-            pkgs.rust-analyzer
-            pkgs.gcc
-            pkgs.pkg-config
-            pkgs.dbus
-          ];
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.netui;
+              defaultText = lib.literalExpression "inputs.netui.packages.\${pkgs.stdenv.hostPlatform.system}.netui";
+              description = "The netui package to install.";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            environment.systemPackages = [ cfg.package ];
+          };
         };
-      });
+    in
+    (flake-utils.lib.eachDefaultSystem
+      (system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          commonArgs = {
+            pname = "netui";
+            version = "0.1.0";
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.dbus ];
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          netui = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+          });
+        in
+        {
+          packages = {
+            default = netui;
+            netui = netui;
+          };
+
+          devShells.default = craneLib.devShell {
+            inputsFrom = [ netui ];
+            packages = [
+              rustToolchain
+              pkgs.rust-analyzer
+              pkgs.gcc
+              pkgs.pkg-config
+              pkgs.dbus
+            ];
+          };
+        })
+    // {
+      nixosModules = {
+        default = nixosModule;
+        netui = nixosModule;
+      };
+    });
 }

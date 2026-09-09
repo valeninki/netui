@@ -147,6 +147,10 @@ impl NetworkdManager for NetworkdDbus {
                 .get("CarrierState")
                 .and_then(serde_json::Value::as_str)
                 == Some("carrier");
+            let link_type = description
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             let ip_addresses = description
                 .get("Addresses")
                 .and_then(serde_json::Value::as_array)
@@ -162,22 +166,12 @@ impl NetworkdManager for NetworkdDbus {
                 operational_state,
                 carrier,
                 ip_addresses,
+                is_wired: link_type == "ether",
+                is_wireless: link_type == "wlan",
             });
         }
 
         Ok(interfaces)
-    }
-
-    async fn set_link_up(&self, interface: &str) -> Result<(), BackendError> {
-        Err(BackendError::Unavailable(format!(
-            "systemd-networkd does not expose a D-Bus operation to bring {interface} up"
-        )))
-    }
-
-    async fn set_link_down(&self, interface: &str) -> Result<(), BackendError> {
-        Err(BackendError::Unavailable(format!(
-            "systemd-networkd does not expose a D-Bus operation to bring {interface} down"
-        )))
     }
 }
 
