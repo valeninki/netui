@@ -122,6 +122,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
                 KeyCode::Char('e' | 'E') => begin_config_edit(app),
                 KeyCode::Char('d' | 'D') if app.is_busy() => app.show_wait_message(),
                 KeyCode::Char('d' | 'D') => forget_selected_network(app),
+                KeyCode::Char('6') => app.toggle_show_ipv6(),
                 _ => {}
             }
         }
@@ -361,6 +362,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("Enter", "action"),
             ("e", "edit profile"),
             ("d", "forget"),
+            ("6", "ipv6"),
         ]
         .as_slice()
     };
@@ -697,7 +699,10 @@ fn render_wifi_networks(frame: &mut Frame, app: &mut App, area: ratatui::layout:
                 ),
                 Span::styled(format!("{:<14}", carrier.0), Style::default().fg(carrier.1)),
             ];
-            spans.extend(interface_address_spans(&interface.ip_addresses));
+            spans.extend(interface_address_spans(
+                &interface.ip_addresses,
+                app.show_ipv6(),
+            ));
             ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
@@ -839,7 +844,10 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     ),
                     Span::styled(format!("{:<14}", carrier.0), interface_style.fg(carrier.1)),
                 ];
-                spans.extend(interface_address_spans(&interface.ip_addresses));
+                spans.extend(interface_address_spans(
+                    &interface.ip_addresses,
+                    app.show_ipv6(),
+                ));
                 ListItem::new(Line::from(spans))
             })
             .collect()
@@ -867,8 +875,13 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
     frame.render_stateful_widget(interfaces, area, app.interface_list_state());
 }
 
-fn interface_address_spans(addresses: &[IpAddr]) -> Vec<Span<'static>> {
-    if addresses.is_empty() {
+fn interface_address_spans(addresses: &[IpAddr], show_ipv6: bool) -> Vec<Span<'static>> {
+    let visible_addresses = addresses
+        .iter()
+        .filter(|address| should_render_address(address, show_ipv6))
+        .collect::<Vec<_>>();
+
+    if visible_addresses.is_empty() {
         return vec![Span::styled(
             " no address",
             Style::default().fg(Color::DarkGray),
@@ -876,7 +889,7 @@ fn interface_address_spans(addresses: &[IpAddr]) -> Vec<Span<'static>> {
     }
 
     let mut spans = vec![Span::raw(" ")];
-    for (index, address) in addresses.iter().enumerate() {
+    for (index, address) in visible_addresses.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw(", "));
         }
@@ -889,6 +902,13 @@ fn interface_address_spans(addresses: &[IpAddr]) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+fn should_render_address(address: &IpAddr, show_ipv6: bool) -> bool {
+    match address {
+        IpAddr::V4(_) => true,
+        IpAddr::V6(address) => show_ipv6 && !address.is_unicast_link_local(),
+    }
 }
 
 fn is_vpn_interface(interface_name: &str) -> bool {
@@ -960,7 +980,9 @@ fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dns_error_message, truncate_line};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::{dns_error_message, should_render_address, truncate_line};
     use crate::backend::BackendError;
 
     #[test]
@@ -981,5 +1003,25 @@ mod tests {
             }),
             "[DNS] Service unavailable, skipped DoT toggle"
         );
+    }
+
+    #[test]
+    fn hides_link_local_ipv6_and_respects_ipv6_visibility() {
+        assert!(should_render_address(
+            &IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            false
+        ));
+        assert!(!should_render_address(
+            &"fe80::1".parse::<Ipv6Addr>().unwrap().into(),
+            true
+        ));
+        assert!(!should_render_address(
+            &"2001:db8::1".parse::<Ipv6Addr>().unwrap().into(),
+            false
+        ));
+        assert!(should_render_address(
+            &"2001:db8::1".parse::<Ipv6Addr>().unwrap().into(),
+            true
+        ));
     }
 }

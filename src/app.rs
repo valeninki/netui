@@ -90,6 +90,7 @@ pub struct App {
     interface_list_state: ListState,
     active_pane: ActivePane,
     wifi_scanning: bool,
+    show_ipv6: bool,
     is_busy: bool,
     action_in_flight: bool,
     input_mode: InputMode,
@@ -115,6 +116,7 @@ impl App {
             interface_list_state: ListState::default(),
             active_pane: ActivePane::Wifi,
             wifi_scanning: false,
+            show_ipv6: false,
             is_busy: false,
             action_in_flight: false,
             input_mode: InputMode::Normal,
@@ -187,6 +189,23 @@ impl App {
 
     pub fn wifi_networks(&self) -> &[WifiNetwork] {
         &self.wifi_networks
+    }
+
+    pub fn show_ipv6(&self) -> bool {
+        self.show_ipv6
+    }
+
+    pub fn toggle_show_ipv6(&mut self) {
+        self.show_ipv6 = !self.show_ipv6;
+        self.last_error = None;
+        self.status_message = format!(
+            "IPv6 display: {}",
+            if self.show_ipv6 {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
     }
 
     pub fn interfaces(&self) -> &[NetworkInterface] {
@@ -849,5 +868,19 @@ mod tests {
         assert!(app.wifi_networks().is_empty());
         assert!(!app.status_is_error());
         assert_eq!(app.status_message(), "Wi-Fi turned off");
+    }
+
+    #[test]
+    fn toggling_ipv6_updates_the_status_message() {
+        let mut app = App::new();
+
+        assert!(!app.show_ipv6());
+        app.toggle_show_ipv6();
+        assert!(app.show_ipv6());
+        assert_eq!(app.status_message(), "IPv6 display: enabled");
+
+        app.toggle_show_ipv6();
+        assert!(!app.show_ipv6());
+        assert_eq!(app.status_message(), "IPv6 display: disabled");
     }
 }
