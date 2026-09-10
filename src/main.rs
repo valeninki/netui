@@ -25,9 +25,90 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use tokio::time::MissedTickBehavior;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+
+#[derive(Clone, Copy)]
+struct KeyHint {
+    key: &'static str,
+    label: &'static str,
+    drop_priority: u8,
+}
+
+const PASSWORD_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "↵",
+        label: "Connect",
+        drop_priority: 0,
+    },
+    KeyHint {
+        key: "Esc",
+        label: "Cancel",
+        drop_priority: 0,
+    },
+];
+
+const CONFIG_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "↑↓/Tab",
+        label: "Field",
+        drop_priority: 1,
+    },
+    KeyHint {
+        key: "←→/Space",
+        label: "Toggle",
+        drop_priority: 2,
+    },
+    KeyHint {
+        key: "↵",
+        label: "Save",
+        drop_priority: 0,
+    },
+    KeyHint {
+        key: "Esc",
+        label: "Cancel",
+        drop_priority: 0,
+    },
+];
+
+const NORMAL_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "q",
+        label: "Quit",
+        drop_priority: 0,
+    },
+    KeyHint {
+        key: "Tab",
+        label: "Pane",
+        drop_priority: 0,
+    },
+    KeyHint {
+        key: "↑↓/jk",
+        label: "Nav",
+        drop_priority: 1,
+    },
+    KeyHint {
+        key: "↵",
+        label: "Action",
+        drop_priority: 3,
+    },
+    KeyHint {
+        key: "e",
+        label: "Edit",
+        drop_priority: 2,
+    },
+    KeyHint {
+        key: "d",
+        label: "Forget",
+        drop_priority: 4,
+    },
+    KeyHint {
+        key: "6",
+        label: "IPv6",
+        drop_priority: 0,
+    },
+];
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -345,26 +426,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let status_area = footer_area;
     let bindings = if matches!(app.input_mode(), InputMode::Input { .. }) {
-        [("Enter", "connect"), ("Esc", "cancel")].as_slice()
+        PASSWORD_KEY_HINTS
     } else if app.is_editing_config() {
-        [
-            ("Up/Down/Tab", "field"),
-            ("Left/Right/Space", "toggle"),
-            ("Enter", "save"),
-            ("Esc", "cancel"),
-        ]
-        .as_slice()
+        CONFIG_KEY_HINTS
     } else {
-        [
-            ("q/Esc/Ctrl+C", "quit"),
-            ("Tab", "pane"),
-            ("Up/Down or j/k", "select"),
-            ("Enter", "action"),
-            ("e", "edit profile"),
-            ("d", "forget"),
-            ("6", "ipv6"),
-        ]
-        .as_slice()
+        NORMAL_KEY_HINTS
     };
     let (key_hints, key_hint_width) = key_hint_line(bindings, status_area.width.saturating_sub(18));
     let [message_area, key_hints_area] = Layout::horizontal([
@@ -457,34 +523,55 @@ fn sanitized_first_line(value: &str) -> String {
     output
 }
 
-fn key_hint_line(bindings: &[(&str, &str)], max_width: u16) -> (Line<'static>, u16) {
-    let mut spans = Vec::new();
-    let mut used_width = 0;
+fn key_hint_line(bindings: &[KeyHint], max_width: u16) -> (Line<'static>, u16) {
+    let mut visible = bindings.to_vec();
+    while key_hint_width(&visible) > usize::from(max_width) {
+        let Some(index) = visible
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.drop_priority > 0)
+            .max_by_key(|(_, hint)| hint.drop_priority)
+            .map(|(index, _)| index)
+        else {
+            return (Line::default(), 0);
+        };
+        visible.remove(index);
+    }
 
-    for (key, action) in bindings {
-        let binding_width = key.len() + 1 + action.len();
-        let separator_width = usize::from(!spans.is_empty()) * 3;
-        if used_width + separator_width + binding_width > usize::from(max_width) {
-            break;
-        }
-        if !spans.is_empty() {
-            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-            used_width += 3;
+    let mut spans = Vec::new();
+    for (index, hint) in visible.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(
-            key.to_string(),
+            format!("[{}]", hint.key),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!(" {action}"),
-            Style::default().fg(Color::DarkGray),
+            format!(" {}", hint.label),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         ));
-        used_width += binding_width;
     }
 
-    (Line::from(spans), used_width as u16)
+    (Line::from(spans), key_hint_width(&visible) as u16)
+}
+
+fn key_hint_width(bindings: &[KeyHint]) -> usize {
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(index, hint)| {
+            usize::from(index > 0) * 2
+                + UnicodeWidthStr::width(hint.key)
+                + 2
+                + 1
+                + UnicodeWidthStr::width(hint.label)
+        })
+        .sum()
 }
 
 fn render_password_input(frame: &mut Frame, app: &App, content_area: Rect) {
@@ -982,7 +1069,9 @@ fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::{dns_error_message, should_render_address, truncate_line};
+    use super::{
+        NORMAL_KEY_HINTS, dns_error_message, key_hint_line, should_render_address, truncate_line,
+    };
     use crate::backend::BackendError;
 
     #[test]
@@ -1023,5 +1112,22 @@ mod tests {
             &"2001:db8::1".parse::<Ipv6Addr>().unwrap().into(),
             true
         ));
+    }
+
+    #[test]
+    fn narrow_key_hints_preserve_core_navigation() {
+        let (line, width) = key_hint_line(NORMAL_KEY_HINTS, 30);
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(width, 30);
+        assert!(rendered.contains("[q] Quit"));
+        assert!(rendered.contains("[Tab] Pane"));
+        assert!(rendered.contains("[6] IPv6"));
+        assert!(!rendered.contains("Forget"));
+        assert!(!rendered.contains("Action"));
     }
 }

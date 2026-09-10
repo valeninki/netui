@@ -21,13 +21,14 @@ The application does not require or invoke NetworkManager.
 
 ## Features
 
-- Dual-pane view of active network connections and system interfaces.
+- Dual-pane layout for active connections and network interfaces.
 - Keyboard-first navigation, connection actions, and session-profile editing.
 - Direct IWD scanning and association with non-fatal handling for disabled Wi-Fi adapters.
 - Privacy-first address formatting: link-local IPv6 (`fe80::/10`) addresses are always hidden to avoid EUI-64 MAC-address leakage.
 - Live IPv6 display toggle with only non-link-local IPv6 addresses shown when enabled.
+- Clean `[LOOP]` classification and neutral loopback state for loopback interfaces.
 - DNS-over-TLS policy control through systemd-resolved.
-- Non-wrapping, responsive status footer with styled, width-aware keybind hints.
+- Clamped single-line status footer with responsive, styled keybind badges.
 - Backend errors are contained in the TUI state rather than leaking D-Bus failures into the terminal.
 
 ## Keybindings
