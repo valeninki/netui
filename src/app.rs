@@ -13,6 +13,7 @@ pub const BACKEND_EVENT_CHANNEL_CAPACITY: usize = 64;
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     WifiScanStateChanged(bool),
+    WifiTurnedOff,
     WifiNetworksUpdated(Vec<WifiNetwork>),
     InterfacesUpdated(Vec<NetworkInterface>),
     ActionCompleted(Result<String, String>),
@@ -140,6 +141,14 @@ impl App {
             BackendEvent::WifiScanStateChanged(scanning) => {
                 self.wifi_scanning = scanning;
                 self.update_busy_state();
+            }
+            BackendEvent::WifiTurnedOff => {
+                self.wifi_scanning = false;
+                self.wifi_networks.clear();
+                self.normalize_wifi_selection();
+                self.update_busy_state();
+                self.last_error = None;
+                self.status_message = "Wi-Fi turned off".into();
             }
             BackendEvent::WifiNetworksUpdated(networks) => {
                 self.wifi_networks = networks;
@@ -821,5 +830,24 @@ mod tests {
 
         assert_eq!(config.ipv4_method, Ipv4Method::Dhcp);
         assert_eq!(config.dns_over_tls, DnsOverTlsMode::Off);
+    }
+
+    #[test]
+    fn wifi_turning_off_preserves_wired_connections_without_an_error() {
+        let mut app = App::new();
+        app.apply_backend_event(BackendEvent::WifiNetworksUpdated(vec![WifiNetwork {
+            ssid: "guest".into(),
+            signal_strength: 80,
+            security: WifiSecurity::Open,
+            secure: false,
+            connected: false,
+            is_known: false,
+        }]));
+
+        app.apply_backend_event(BackendEvent::WifiTurnedOff);
+
+        assert!(app.wifi_networks().is_empty());
+        assert!(!app.status_is_error());
+        assert_eq!(app.status_message(), "Wi-Fi turned off");
     }
 }

@@ -134,6 +134,7 @@ pub struct NetworkInterface {
     pub ip_addresses: Vec<IpAddr>,
     pub is_wired: bool,
     pub is_wireless: bool,
+    pub is_loopback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

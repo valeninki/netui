@@ -151,6 +151,7 @@ impl NetworkdManager for NetworkdDbus {
                 .get("Type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
+            let is_loopback = name == "lo" || link_type == "loopback";
             let ip_addresses = description
                 .get("Addresses")
                 .and_then(serde_json::Value::as_array)
@@ -168,6 +169,7 @@ impl NetworkdManager for NetworkdDbus {
                 ip_addresses,
                 is_wired: link_type == "ether",
                 is_wireless: link_type == "wlan",
+                is_loopback,
             });
         }
 

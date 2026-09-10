@@ -121,6 +121,37 @@ impl IwdBackend {
             let mut last_scan = None;
 
             loop {
+                match backend.is_wifi_active().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        last_scan = None;
+                        if !send_wifi_turned_off(&sender).await {
+                            return;
+                        }
+                        tokio::time::sleep(EMPTY_REFRESH_INTERVAL).await;
+                        continue;
+                    }
+                    Err(error) if wifi_is_off_error(&error) => {
+                        last_scan = None;
+                        if !send_wifi_turned_off(&sender).await {
+                            return;
+                        }
+                        tokio::time::sleep(EMPTY_REFRESH_INTERVAL).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        if sender
+                            .send(BackendEvent::Error(error.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                }
+
                 let mut scan_active = backend.is_scan_running().await.unwrap_or(false);
                 let scan_due = last_scan
                     .map(|instant: Instant| instant.elapsed() >= SCAN_REQUEST_INTERVAL)
@@ -139,6 +170,14 @@ impl IwdBackend {
                     match backend.scan().await {
                         Ok(()) => scan_active = true,
                         Err(error) if scan_in_progress(&error) => scan_active = true,
+                        Err(error) if wifi_is_off_error(&error) => {
+                            last_scan = None;
+                            if !send_wifi_turned_off(&sender).await {
+                                return;
+                            }
+                            tokio::time::sleep(EMPTY_REFRESH_INTERVAL).await;
+                            continue;
+                        }
                         Err(error) => {
                             if sender
                                 .send(BackendEvent::Error(format!(
@@ -168,6 +207,13 @@ impl IwdBackend {
                             return;
                         }
                         refresh_interval
+                    }
+                    Err(error) if wifi_is_off_error(&error) => {
+                        last_scan = None;
+                        if !send_wifi_turned_off(&sender).await {
+                            return;
+                        }
+                        EMPTY_REFRESH_INTERVAL
                     }
                     Err(error) => {
                         if sender
@@ -278,6 +324,27 @@ impl IwdBackend {
                 .await
                 .map_err(dbus_error)?
             {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn is_wifi_active(&self) -> Result<bool, BackendError> {
+        let station_paths = self.station_paths().await?;
+        if station_paths.is_empty() {
+            return Ok(false);
+        }
+
+        for path in station_paths {
+            let state = self
+                .station_proxy(&path)
+                .await?
+                .state()
+                .await
+                .map_err(dbus_error)?;
+            if !state.eq_ignore_ascii_case("off") {
                 return Ok(true);
             }
         }
@@ -507,12 +574,25 @@ impl WifiBackend for IwdBackend {
             ));
         }
 
+        let mut active_station = false;
         for path in station_paths {
-            self.station_proxy(&path)
-                .await?
-                .scan()
+            let station = self.station_proxy(&path).await?;
+            if station
+                .state()
                 .await
-                .map_err(dbus_error)?;
+                .map_err(dbus_error)?
+                .eq_ignore_ascii_case("off")
+            {
+                continue;
+            }
+            active_station = true;
+            station.scan().await.map_err(dbus_error)?;
+        }
+
+        if !active_station {
+            return Err(BackendError::Unavailable(
+                "iwd is not managing an active station interface".into(),
+            ));
         }
 
         Ok(())
@@ -629,4 +709,50 @@ fn dbus_error(error: impl Display) -> BackendError {
 
 fn scan_in_progress(error: &BackendError) -> bool {
     matches!(error, BackendError::Operation(message) if message.contains("InProgress"))
+}
+
+async fn send_wifi_turned_off(sender: &mpsc::Sender<BackendEvent>) -> bool {
+    sender.send(BackendEvent::WifiTurnedOff).await.is_ok()
+}
+
+fn wifi_is_off_error(error: &BackendError) -> bool {
+    if error.is_service_unavailable() {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "iwd is not managing",
+        "not managing a station",
+        "no station interface",
+        "no such device",
+        "device not found",
+        "powered off",
+        "serviceunknown",
+        "namehasnoowner",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wifi_is_off_error;
+    use crate::backend::BackendError;
+
+    #[test]
+    fn recognizes_non_fatal_iwd_off_states() {
+        assert!(wifi_is_off_error(&BackendError::Unavailable(
+            "iwd is not managing a station interface".into()
+        )));
+        assert!(wifi_is_off_error(&BackendError::Operation(
+            "device not found".into()
+        )));
+        assert!(wifi_is_off_error(&BackendError::ServiceUnavailable {
+            service: "net.connman.iwd".into(),
+        }));
+        assert!(!wifi_is_off_error(&BackendError::Operation(
+            "permission denied".into()
+        )));
+    }
 }

@@ -695,7 +695,7 @@ fn render_wifi_networks(frame: &mut Frame, app: &mut App, area: ratatui::layout:
                     format!("{:<20}", truncate_column(&interface.name, 20)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {}", carrier.0), Style::default().fg(carrier.1)),
+                Span::styled(format!("{:<14}", carrier.0), Style::default().fg(carrier.1)),
             ];
             spans.extend(interface_address_spans(&interface.ip_addresses));
             ListItem::new(Line::from(spans))
@@ -716,7 +716,7 @@ fn render_wifi_networks(frame: &mut Frame, app: &mut App, area: ratatui::layout:
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
-                format!("{:<20} ", truncate_column(&network.ssid, 20)),
+                format!("{:<20}", truncate_column(&network.ssid, 20)),
                 Style::default().fg(if network.connected {
                     Color::Green
                 } else {
@@ -724,11 +724,11 @@ fn render_wifi_networks(frame: &mut Frame, app: &mut App, area: ratatui::layout:
                 }),
             ),
             Span::styled(
-                format!("{:>4}% ", network.signal_strength),
+                format!("{:>4}%", network.signal_strength),
                 Style::default().fg(signal_color),
             ),
             Span::styled(
-                format!("{:>15}", wifi_security_label(network.security)),
+                format!(" {:<9}", wifi_security_label(network.security)),
                 Style::default().fg(Color::Cyan),
             ),
         ];
@@ -778,16 +778,29 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         app.interfaces()
             .iter()
             .map(|interface| {
-                let state_color = match interface.operational_state {
-                    OperationalState::Routable => Color::Green,
-                    OperationalState::Degraded
-                    | OperationalState::Off
-                    | OperationalState::NoCarrier => Color::Red,
-                    OperationalState::Dormant => Color::Yellow,
-                    OperationalState::Unknown => Color::Cyan,
+                let loopback = interface.is_loopback || interface.name == "lo";
+                let state_label = if loopback
+                    && matches!(interface.operational_state, OperationalState::Unknown)
+                {
+                    "loopback"
+                } else {
+                    operational_state_label(interface.operational_state)
                 };
-                let is_active = interface.carrier
-                    || matches!(interface.operational_state, OperationalState::Routable);
+                let state_color = if loopback && state_label == "loopback" {
+                    Color::Cyan
+                } else {
+                    match interface.operational_state {
+                        OperationalState::Routable => Color::Green,
+                        OperationalState::Degraded
+                        | OperationalState::Off
+                        | OperationalState::NoCarrier => Color::Red,
+                        OperationalState::Dormant => Color::Yellow,
+                        OperationalState::Unknown => Color::Cyan,
+                    }
+                };
+                let carrier_on = interface.carrier || loopback;
+                let is_active =
+                    carrier_on || matches!(interface.operational_state, OperationalState::Routable);
                 let interface_style = if is_active {
                     Style::default()
                         .fg(Color::Green)
@@ -795,7 +808,9 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 } else {
                     Style::default()
                 };
-                let interface_kind = if interface.is_wired {
+                let interface_kind = if loopback {
+                    ("[LOOP]", Color::Cyan)
+                } else if interface.is_wired {
                     ("[ETH]", Color::Cyan)
                 } else if interface.is_wireless {
                     ("[Wi-Fi]", Color::Yellow)
@@ -804,7 +819,7 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 } else {
                     ("[Other]", Color::DarkGray)
                 };
-                let carrier = if interface.carrier {
+                let carrier = if carrier_on {
                     ("Carrier: On", Color::Green)
                 } else {
                     ("Carrier: Off", Color::Red)
@@ -819,13 +834,7 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                         interface_style,
                     ),
                     Span::styled(
-                        format!(
-                            "{:<12}",
-                            truncate_column(
-                                operational_state_label(interface.operational_state),
-                                12
-                            )
-                        ),
+                        format!("{:<12}", truncate_column(state_label, 12)),
                         interface_style.fg(state_color),
                     ),
                     Span::styled(format!("{:<14}", carrier.0), interface_style.fg(carrier.1)),
@@ -861,12 +870,12 @@ fn render_interfaces(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
 fn interface_address_spans(addresses: &[IpAddr]) -> Vec<Span<'static>> {
     if addresses.is_empty() {
         return vec![Span::styled(
-            "  no address",
+            " no address",
             Style::default().fg(Color::DarkGray),
         )];
     }
 
-    let mut spans = vec![Span::raw("  ")];
+    let mut spans = vec![Span::raw(" ")];
     for (index, address) in addresses.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw(", "));
